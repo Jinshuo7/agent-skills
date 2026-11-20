@@ -1,0 +1,432 @@
+{
+ "Nano Banana 2.1": {
+  "multiplier": "0.63\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free",
+   "4K": "credits"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "GPT Image 2.5": {
+  "multiplier": "1\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Quality",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free",
+   "3K": "free",
+   "4K": "free"
+  },
+  "combos": {
+   "Auto Auto": "free",
+   "Auto Low": "free",
+   "Auto Medium": "free",
+   "Auto High": "free",
+   "Auto X-High": "credits",
+   "Auto Max": "credits",
+   "1K Auto": "free",
+   "1K Low": "free",
+   "1K Medium": "free",
+   "1K High": "free",
+   "1K X-High": "credits",
+   "1K Max": "credits",
+   "2K Auto": "free",
+   "2K Low": "free",
+   "2K Medium": "free",
+   "2K High": "free",
+   "2K X-High": "credits",
+   "2K Max": "credits",
+   "3K Auto": "free",
+   "3K Low": "free",
+   "3K Medium": "free",
+   "3K High": "free",
+   "3K X-High": "credits",
+   "3K Max": "credits",
+   "4K Auto": "free",
+   "4K Low": "free",
+   "4K Medium": "free",
+   "4K High": "free",
+   "4K X-High": "credits",
+   "4K Max": "credits"
+  },
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "GPT Image 2": {
+  "multiplier": "1\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Quality",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free",
+   "3K": "free",
+   "4K": "free"
+  },
+  "combos": {
+   "Auto Auto": "free",
+   "Auto Low": "free",
+   "Auto Medium": "free",
+   "Auto High": "credits",
+   "1K Auto": "free",
+   "1K Low": "free",
+   "1K Medium": "free",
+   "1K High": "credits",
+   "2K Auto": "free",
+   "2K Low": "free",
+   "2K Medium": "free",
+   "2K High": "credits",
+   "3K Auto": "free",
+   "3K Low": "free",
+   "3K Medium": "free",
+   "3K High": "credits",
+   "4K Auto": "free",
+   "4K Low": "free",
+   "4K Medium": "free",
+   "4K High": "credits"
+  },
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "GPT Image 2.6": {
+  "multiplier": "1\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Quality",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free",
+   "3K": "free",
+   "4K": "free"
+  },
+  "combos": {
+   "Auto Auto": "free",
+   "Auto Low": "free",
+   "Auto Medium": "free",
+   "Auto High": "free",
+   "Auto X-High": "credits",
+   "Auto Max": "credits",
+   "1K Auto": "free",
+   "1K Low": "free",
+   "1K Medium": "free",
+   "1K High": "free",
+   "1K X-High": "credits",
+   "1K Max": "credits",
+   "2K Auto": "free",
+   "2K Low": "free",
+   "2K Medium": "free",
+   "2K High": "free",
+   "2K X-High": "credits",
+   "2K Max": "credits",
+   "3K Auto": "free",
+   "3K Low": "free",
+   "3K Medium": "free",
+   "3K High": "free",
+   "3K X-High": "credits",
+   "3K Max": "credits",
+   "4K Auto": "free",
+   "4K Low": "free",
+   "4K Medium": "free",
+   "4K High": "free",
+   "4K X-High": "credits",
+   "4K Max": "credits"
+  },
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Bytedance Seedream 5.0 Pro": {
+  "multiplier": "0.85\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Bytedance Seedream 5.5": {
+  "multiplier": "0.3\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "credits"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Nano Banana 2 Flash Lite": {
+  "multiplier": "0.63\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Generation count"
+  ],
+  "sizes": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Qwen Image 3": {
+  "multiplier": "1.48\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Generation count"
+  ],
+  "sizes": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Nano Banana Pro": {
+  "multiplier": "2.48\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free",
+   "4K": "credits"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Grok Imagine Image 2.0": {
+  "multiplier": "1.3\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Bytedance Seedream v5 Lite": {
+  "multiplier": "0.67\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "2K": "free",
+   "3K": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "FLUX 3 Image": {
+  "multiplier": "0.89\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Image Size",
+   "Generation count"
+  ],
+  "sizes": {
+   "Auto": "free",
+   "1K": "free",
+   "2K": "free",
+   "4K": "credits"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Z-Image Turbo": {
+  "multiplier": "0.37\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Generation count"
+  ],
+  "sizes": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Krea 2 Turbo": {
+  "multiplier": "0.37\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Generation count"
+  ],
+  "sizes": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Recraft V4.1": {
+  "multiplier": "0.67\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Generation count"
+  ],
+  "sizes": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Ideogram V4": {
+  "multiplier": "0.93\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Generation count"
+  ],
+  "sizes": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  },
+  "combos": {},
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ },
+ "Ideogram V4.5": {
+  "multiplier": "2.22\u00d7",
+  "model_gated": false,
+  "rows": [
+   "Quality",
+   "Generation count"
+  ],
+  "sizes": {
+   "Low": "free",
+   "Medium": "free",
+   "High": "free",
+   "Very Low": "free"
+  },
+  "combos": {
+   "Low Low": "free",
+   "Low Medium": "free",
+   "Low High": "free",
+   "Low Very Low": "free",
+   "Medium Low": "free",
+   "Medium Medium": "free",
+   "Medium High": "free",
+   "Medium Very Low": "free",
+   "High Low": "free",
+   "High Medium": "free",
+   "High High": "free",
+   "High Very Low": "free",
+   "Very Low Low": "free",
+   "Very Low Medium": "free",
+   "Very Low High": "free",
+   "Very Low Very Low": "free"
+  },
+  "count": {
+   "1": "free",
+   "2": "free",
+   "4": "free"
+  }
+ }
+}

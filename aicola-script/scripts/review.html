@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AiCola Pack Review</title>
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e2e0da;
+  --accent: #c2410c; --accent-ink: #ffffff; --err: #b91c1c; --err-bg: #fdecec;
+  --warn: #92400e; --warn-bg: #fdf4e3; --ok: #166534; --ok-bg: #e9f6ee; --code: #f1efea;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514; --panel: #1f1f1d; --ink: #ecebe7; --muted: #9b9a95; --line: #33332f;
+    --accent: #fb923c; --accent-ink: #1d1d1b; --err: #f87171; --err-bg: #3a1d1d;
+    --warn: #fbbf24; --warn-bg: #352a14; --ok: #4ade80; --ok-bg: #16301f; --code: #262624;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); }
+.bar { max-width: 1100px; margin: 0 auto; padding: 12px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+h1 { font-size: 17px; margin: 0; flex: 1; min-width: 200px; }
+h1 small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; word-break: break-all; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+.steps { display: flex; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.steps span { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; }
+.steps b { color: var(--ink); }
+section.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+section.card h2 { font-size: 15px; margin: 0 0 8px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.dest { font-weight: 400; color: var(--muted); font-size: 13px; }
+.count { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.count.over { color: var(--err); font-weight: 600; }
+textarea { width: 100%; min-height: 120px; resize: vertical; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--code); color: var(--ink); padding: 10px; font: 13px/1.6 ui-monospace, "SF Mono", Menlo, monospace; }
+textarea.big { min-height: 520px; }
+button { font: inherit; font-size: 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink); padding: 6px 12px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+input[type=text] { font: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; background: var(--panel); color: var(--ink); min-width: 0; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+ul.issues { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 320px; overflow: auto; }
+ul.issues li { padding: 4px 8px; border-radius: 6px; font-size: 13px; }
+li.error { background: var(--err-bg); color: var(--err); }
+li.warn { background: var(--warn-bg); color: var(--warn); }
+.pill { font-size: 12px; padding: 1px 8px; border-radius: 999px; }
+.pill.error { background: var(--err-bg); color: var(--err); }
+.pill.warn { background: var(--warn-bg); color: var(--warn); }
+.pill.ok { background: var(--ok-bg); color: var(--ok); }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+td { border-bottom: 1px solid var(--line); padding: 6px 4px; }
+td:first-child { color: var(--muted); width: 40%; }
+td input { width: 100%; }
+pre.log { background: var(--code); border-radius: 8px; padding: 10px; font-size: 12px; max-height: 360px; overflow: auto; white-space: pre-wrap; margin: 8px 0 0; }
+pre.todo { white-space: pre-wrap; font-size: 13px; margin: 0; }
+.note { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+.dirty { color: var(--accent); font-size: 13px; }
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <h1>AiCola pack review<small id="packpath"></small></h1>
+  <span id="dirty" class="dirty"></span>
+  <button id="save" class="primary">Save + check</button>
+</div></header>
+<main>
+  <div class="steps">
+    <span><b>1</b> Read and edit here</span><span><b>2</b> Save + check until no errors</span>
+    <span><b>3</b> Fill aicola (stops before 保存并重新拆分)</span><span><b>4</b> You look on aicola and click 保存并重新拆分</span>
+  </div>
+
+  <section class="card">
+    <h2>Check <span id="summary"></span></h2>
+    <ul class="issues" id="issues"></ul>
+  </section>
+
+  <section class="card">
+    <h2>待确认 <span class="dest">things DeepSeek couldn't tell from the story</span></h2>
+    <pre class="todo" id="todo"></pre>
+  </section>
+
+  <div id="fields"></div>
+
+  <section class="card">
+    <h2>Settings <span class="dest">项目设置, applied by the fill script</span></h2>
+    <table id="settings"></table>
+  </section>
+
+  <section class="card" id="fillcard">
+    <h2>Fill aicola</h2>
+    <div class="row">
+      <input type="text" id="project" placeholder="aicola project name (one you created, empty)" style="flex:1">
+      <button id="dry">Dry run</button>
+      <button id="fill" class="primary">Fill aicola</button>
+    </div>
+    <p class="note">Uses the logged-in agent-browser session <code>aicola</code>. Fills the text fields and settings of that one project. Never clicks 保存并重新拆分, 一键生成, 分步制作 or 生成视频. Dry run only finds the project and every field, typing nothing.</p>
+    <pre class="log" id="log" hidden></pre>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+let data = null, dirty = false;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function setDirty(v) { dirty = v; $('#dirty').textContent = v ? 'unsaved changes' : ''; }
+
+function render() {
+  $('#packpath').textContent = data.pack;
+  const e = data.check.filter(i => i.level === 'error').length, w = data.check.length - e;
+  $('#summary').innerHTML = (e ? `<span class="pill error">${e} errors</span> ` : '<span class="pill ok">no errors</span> ') +
+    (w ? `<span class="pill warn">${w} warnings</span>` : '');
+  $('#issues').innerHTML = data.check.map(i => `<li class="${i.level}">${esc(i.where)}: ${esc(i.msg)}</li>`).join('') || '<li>Nothing found.</li>';
+  $('#todo').textContent = data.todo || '—';
+  $('#fields').innerHTML = data.fields.map(f => `
+    <section class="card" id="f-${f.key}">
+      <h2>${esc(f.file)} <span class="dest">${esc(f.label)}</span>
+        <span class="count" data-count="${f.key}"></span></h2>
+      <textarea data-key="${f.key}" class="${f.key === 'script' ? 'big' : ''}" spellcheck="false">${esc(f.text)}</textarea>
+      <div class="row" style="margin-top:6px"><button data-copy="${f.key}">Copy</button></div>
+    </section>`).join('');
+  $('#settings').innerHTML = Object.entries(data.settings).map(([k, v]) =>
+    `<tr><td>${esc(k)}</td><td><input type="text" data-setting="${esc(k)}" value="${esc(v)}"></td></tr>`).join('');
+  if (!$('#project').value) $('#project').value = data.project || '';
+  document.querySelectorAll('textarea').forEach(t => { count(t); t.addEventListener('input', () => { count(t); setDirty(true); }); });
+  document.querySelectorAll('[data-setting]').forEach(i => i.addEventListener('input', () => setDirty(true)));
+  document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => {
+    navigator.clipboard.writeText(document.querySelector(`textarea[data-key="${b.dataset.copy}"]`).value);
+    b.textContent = 'Copied'; setTimeout(() => b.textContent = 'Copy', 1200);
+  });
+  setDirty(false);
+}
+
+function count(t) {
+  const f = data.fields.find(x => x.key === t.dataset.key), n = t.value.length;
+  const el = document.querySelector(`[data-count="${f.key}"]`);
+  el.textContent = f.limit ? `${n.toLocaleString()} / ${f.limit.toLocaleString()}` : `${n.toLocaleString()} characters`;
+  el.classList.toggle('over', !!f.limit && n > f.limit);
+}
+
+async function load() { data = await (await fetch('/api/pack')).json(); render(); }
+
+async function save() {
+  const fields = {}, settings = {};
+  document.querySelectorAll('textarea[data-key]').forEach(t => fields[t.dataset.key] = t.value);
+  document.querySelectorAll('[data-setting]').forEach(i => settings[i.dataset.setting] = i.value);
+  data = await (await fetch('/api/save', {method: 'POST', body: JSON.stringify({fields, settings})})).json();
+  render();
+}
+
+async function fill(dry) {
+  if (dirty) await save();
+  const errs = data.check.filter(i => i.level === 'error').length;
+  if (!dry && errs && !confirm(`${errs} check errors remain. Fill anyway?`)) return;
+  const project = $('#project').value.trim();
+  if (!project) { alert('Type the aicola project name first.'); return; }
+  const r = await fetch('/api/fill', {method: 'POST', body: JSON.stringify({project, dry})});
+  if (!r.ok) { alert((await r.json()).error); return; }
+  poll();
+}
+
+async function poll() {
+  const log = $('#log'); log.hidden = false;
+  $('#fill').disabled = $('#dry').disabled = true;
+  while (true) {
+    const s = await (await fetch('/api/fill-log')).json();
+    log.textContent = s.log; log.scrollTop = log.scrollHeight;
+    if (!s.running) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  $('#fill').disabled = $('#dry').disabled = false;
+}
+
+$('#save').onclick = save;
+$('#dry').onclick = () => fill(true);
+$('#fill').onclick = () => fill(false);
+window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+load();
+</script>
+</body>
+</html>

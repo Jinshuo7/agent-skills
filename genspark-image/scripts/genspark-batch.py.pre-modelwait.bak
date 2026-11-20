@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""Generate images on genspark.ai/ai_image (free quota) by driving the logged-in Chrome window.
+
+Jobs TSV, one per line:  <prompt-file or prompt text> TAB <output path> [TAB model [TAB ratio [TAB size [TAB quality [TAB count [TAB refs]]]]]]
+  model: REQUIRED. Name from Genspark's model menu, e.g. "Nano Banana Pro", "GPT Image 2.6", "Seedream 5.5"
+         (the "Bytedance " prefix may be left off)
+  ratio: REQUIRED. 21:9 2:1 16:9 3:2 4:3 1:1 3:4 2:3 9:16 1:2 9:21 or "Auto Size"
+  size:  Auto 1K 2K 3K 4K, models with a size row only (blank = that model's highest free size)
+  quality: GPT Image and Ideogram V4.5 only (blank = that model's highest free quality)
+  Blank size/quality are filled per model from genspark-free-limits.json, never carried over from the last job.
+  A setting the model lacks, or one that costs credits, stops the run before anything is generated.
+  count: 1 2 4 images from one request (blank = 1). With 2 or 4, files are saved as <output>-1.ext, <output>-2.ext ...
+  refs:  reference images, comma-separated paths; pasted into the prompt box like Cmd+V
+Auto references: if the folder it runs from has style/auto-refs.txt (one path per line, # comments),
+  those images are pasted first in every job. Only projects that have the file get them. --no-auto-refs turns it off.
+After each job's images are saved, its Genspark chat is deleted from the task list (by chat id; never a pinned one). --keep-chats keeps them.
+Lines starting with # are skipped. Jobs whose (first) output already exists are skipped.
+Free settings per model: free-limits.md (next to SKILL.md)
+
+Needs the dedicated Chrome window running (see --help-chrome). Each run opens and drives its own tab, so several runs can go at once.
+Usage (from your project folder):  <skill>/scripts/genspark-batch.py jobs.tsv [--gap 1-7] [--per-hour 25]
+Check settings only, no browser:  <skill>/scripts/genspark-batch.py jobs.tsv --check
+"""
+import argparse, base64, datetime as dt, json, os, random, re, subprocess, sys, time
+
+CDP = "9333"
+URL = "https://www.genspark.ai/ai_image"
+CHROME_CMD = ('open -na "Google Chrome" --args --user-data-dir="$HOME/.agent-browser-profiles/genspark-chrome" '
+              '--remote-debugging-port=9333 --no-first-run --disable-backgrounding-occluded-windows '
+              '--disable-renderer-backgrounding --disable-background-timer-throttling ' + URL)
+STOP_RE = re.compile(r"(quota|limit)[^.\n]{0,60}(reached|exceeded|used up|run out)|upgrade (to|your)|"
+                     r"insufficient credits|not enough credits|this option uses credits|will use credits|continue with credits|verify (that )?you are (a )?human|captcha", re.I)
+
+
+class Stop(Exception):
+    pass
+
+
+SIZE_ORDER = ["1K", "2K", "3K", "4K"]                                # "Auto" is never picked as "highest"
+QUAL_ORDER = ["Very Low", "Low", "Medium", "High", "X-High", "Max"]
+
+
+def load_limits():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "genspark-free-limits.json")
+    return json.load(open(path, encoding="utf-8"))
+
+
+def resolve_free(j, limits):
+    """Fill blank size/quality with the model's highest free setting and refuse settings that cost credits.
+    Returns an error string, or None when the job is fine. Rewrites j['model'] to the exact menu name."""
+    want = j["model"].strip()
+    if not want:
+        return "no model given (column 3); every job needs an explicit model"
+    names = [m for m in limits if m.lower() == want.lower()] or \
+            [m for m in limits if m.lower().endswith(" " + want.lower())]
+    if len(names) != 1:
+        return (f"model '{want}' is not in genspark-free-limits.json" if not names else f"model '{want}' is ambiguous: {names}") + \
+               " (rerun genspark-probe-free.py if Genspark added it)"
+    j["model"] = m = names[0]
+    L = limits[m]; rows = L.get("rows", [])
+    first = L.get("sizes", {})                                        # options of the model's first row
+    has_size, has_q = "Image Size" in rows, "Quality" in rows
+    if j["size"] and not has_size:
+        return f"{m} has no size setting; leave size blank"
+    if j["quality"] and not has_q:
+        return f"{m} has no quality setting; leave quality blank"
+    if has_size and has_q:                                            # GPT Image: size x quality combos
+        free = {tuple(k.rsplit(" ", 1)) for k, v in L.get("combos", {}).items() if v == "free"}
+        if not j["size"]:
+            ok = [s for s in SIZE_ORDER if any(c[0] == s and (not j["quality"] or c[1] == j["quality"]) for c in free)]
+            j["size"] = ok[-1] if ok else "Auto"
+        if not j["quality"]:
+            ok = [q for q in QUAL_ORDER if (j["size"], q) in free]
+            j["quality"] = ok[-1] if ok else "Auto"
+        if (j["size"], j["quality"]) not in free:
+            return f"{m} at {j['size']} {j['quality']} is not free (see genspark-free-limits.md)"
+    elif has_size or has_q:                                           # one setting row
+        key, order = ("size", SIZE_ORDER) if has_size else ("quality", QUAL_ORDER)
+        free = [o for o, v in first.items() if v == "free"]
+        if not j[key]:
+            ok = [o for o in order if o in free]
+            j[key] = ok[-1] if ok else "Auto"
+        if j[key] not in free:
+            return f"{m} at {key} {j[key]} is not free (see genspark-free-limits.md)"
+    if L.get("count", {}).get(j["count"], "free") != "free":
+        return f"{m} with count {j['count']} is not free"
+    return None
+
+
+# ---- Browser layer: one Chrome tab per run, driven directly over the DevTools protocol by its target id.
+#      Several runs can share the Genspark Chrome window, each in its own tab (user, 2026-11-13).
+import socket, struct, urllib.request, urllib.parse
+
+
+class Tab:
+    def __init__(self, url):
+        # Open the tab in the background (Target.createTarget, background=True) so Chrome doesn't come to the
+        # front and macOS doesn't switch Spaces (user, 2026-11-16). /json/new opened it in the foreground.
+        ver = json.load(urllib.request.urlopen(f"http://127.0.0.1:{CDP}/json/version", timeout=20))
+        browser = Tab.__new__(Tab)
+        browser._connect(ver["webSocketDebuggerUrl"])
+        try:
+            self.id = browser.call("Target.createTarget", {"url": url, "background": True}, 20)["targetId"]
+        finally:
+            browser.sock.close()
+        self._connect(f"ws://127.0.0.1:{CDP}/devtools/page/{self.id}")
+
+    def _connect(self, ws_url):
+        u = urllib.parse.urlparse(ws_url)
+        self.sock = socket.create_connection((u.hostname, u.port), timeout=30)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        hdr = b""
+        while b"\r\n\r\n" not in hdr:
+            hdr += self.sock.recv(1)
+        if b" 101 " not in hdr.split(b"\r\n")[0]:
+            raise RuntimeError(f"DevTools handshake failed: {hdr[:200]!r}")
+        self.n = 0
+
+    def _send(self, text):
+        data = text.encode(); mask = os.urandom(4); L = len(data)
+        head = bytes([0x81]) + (bytes([0x80 | L]) if L < 126 else
+                                bytes([0x80 | 126]) + struct.pack(">H", L) if L < 65536 else
+                                bytes([0x80 | 127]) + struct.pack(">Q", L))
+        m = (mask * (L // 4 + 1))[:L]
+        self.sock.sendall(head + mask + (int.from_bytes(data, "big") ^ int.from_bytes(m, "big")).to_bytes(L, "big") if L else head + mask)
+
+    def _exact(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(min(1 << 20, n - len(buf)))
+            if not chunk:
+                raise RuntimeError("DevTools connection closed")
+            buf += chunk
+        return bytes(buf)
+
+    def _recv(self):
+        msg = b""
+        while True:
+            b0, b1 = self._exact(2)
+            L = b1 & 0x7F
+            if L == 126: L = struct.unpack(">H", self._exact(2))[0]
+            elif L == 127: L = struct.unpack(">Q", self._exact(8))[0]
+            if b1 & 0x80: self._exact(4)          # server frames are never masked, but be safe
+            payload = self._exact(L)
+            op = b0 & 0x0F
+            if op == 8: raise RuntimeError("DevTools connection closed")
+            if op in (9, 10): continue          # ping/pong
+            msg += payload
+            if b0 & 0x80: return msg.decode("utf-8", "replace")
+
+    def call(self, method, params=None, timeout=90):
+        self.n += 1; mid = self.n
+        self.sock.settimeout(timeout)
+        self._send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        while True:
+            m = json.loads(self._recv())
+            if m.get("id") == mid:
+                if "error" in m:
+                    raise RuntimeError(f"{method} failed: {m['error']}")
+                return m.get("result", {})
+
+    def close(self):
+        try:
+            self.sock.close()
+            urllib.request.urlopen(f"http://127.0.0.1:{CDP}/json/close/{self.id}", timeout=10)
+        except Exception:
+            pass
+
+
+TAB = None
+
+
+def ab(cmd, *args, stdin=None, timeout=90):
+    """The few browser actions the script uses, sent to this run's own tab."""
+    if cmd == "open":
+        TAB.call("Page.navigate", {"url": args[0]}, timeout)
+        time.sleep(2)
+        end = time.time() + 40
+        while time.time() < end and js("document.readyState") != "complete":
+            time.sleep(1)
+    elif cmd == "eval":
+        r = TAB.call("Runtime.evaluate", {"expression": stdin, "awaitPromise": True, "returnByValue": True}, timeout)
+        if "exceptionDetails" in r:
+            raise RuntimeError(f"page script failed: {str(r['exceptionDetails'])[:300]}")
+        return r.get("result", {}).get("value")
+    elif cmd == "click":
+        box = js(f"(()=>{{const e=document.querySelector({json.dumps(args[0])});if(!e)return null;"
+                 f"const r=e.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];}})()")
+        if not box:
+            raise RuntimeError(f"click: {args[0]} not found")
+        x, y = box[0] + random.uniform(-2, 2), box[1] + random.uniform(-2, 2)
+        TAB.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        for t in ("mousePressed", "mouseReleased"):
+            TAB.call("Input.dispatchMouseEvent", {"type": t, "x": x, "y": y, "button": "left", "clickCount": 1})
+    elif cmd == "fill":
+        js(f"(()=>{{const e=document.querySelector({json.dumps(args[0])});e.focus();e.select();return true;}})()")
+        TAB.call("Input.insertText", {"text": args[1]}, timeout)
+    elif cmd == "press":
+        k = {"Escape": ("Escape", 27), "Enter": ("Enter", 13)}[args[0]]
+        for t in ("keyDown", "keyUp"):
+            TAB.call("Input.dispatchKeyEvent", {"type": t, "key": k[0], "code": k[0], "windowsVirtualKeyCode": k[1]})
+    elif cmd == "screenshot":
+        open(args[0], "wb").write(base64.b64decode(TAB.call("Page.captureScreenshot", {"format": "png"})["data"]))
+    else:
+        raise RuntimeError(f"unknown browser action {cmd}")
+
+
+def js(code, timeout=90):
+    return ab("eval", stdin=code, timeout=timeout)
+
+
+def human_pause(a=0.4, b=1.3):
+    time.sleep(random.uniform(a, b))
+
+
+def click_marked(find_js, what):
+    """find_js: JS expression returning an element or null. Marks it, then clicks it with a real input event."""
+    ok = js(f"(()=>{{document.querySelectorAll('[data-gsb]').forEach(e=>e.removeAttribute('data-gsb'));"
+            f"const el=({find_js}); if(!el) return false; el.setAttribute('data-gsb','1'); el.scrollIntoView({{block:'center'}}); return true;}})()")
+    if ok is not True:
+        raise Stop(f"could not find {what} on the page (Genspark may have changed its layout)")
+    human_pause(0.2, 0.6)
+    ab("click", "[data-gsb='1']")
+    human_pause()
+    credit_gate()
+
+
+def credit_gate():
+    """Genspark pops up 'This option uses credits' when a model/size/quality is outside the free plan.
+    Never continue: close the pop-up and stop."""
+    if js("!!document.querySelector('.paid-confirm-content')") is True:
+        ab("click", ".paid-confirm-content .close-btn")   # the ×; never 'Continue' or 'don't ask again'
+        raise Stop("that model/size/quality would use credits (not in the free plan); pick a free setting, see free-limits.md in the skill folder")
+
+
+def wait_for(cond_js, secs, what):
+    end = time.time() + secs
+    while time.time() < end:
+        if js(cond_js) is True:
+            return
+        time.sleep(1)
+    raise Stop(f"timed out waiting for {what}")
+
+
+def check_blockers():
+    info = js("(()=>({t:document.body.innerText.slice(0,20000),"
+              # Genspark always loads an invisible reCAPTCHA; only a visible challenge frame counts
+              "f:[...document.querySelectorAll('iframe')].filter(f=>{const r=f.getBoundingClientRect();"
+              "return r.width>60&&r.height>60&&getComputedStyle(f).visibility!='hidden';}).map(f=>f.src).join(' ')}))()")
+    if isinstance(info, dict):
+        if re.search(r"captcha|turnstile|hcaptcha|challenge", info.get("f", ""), re.I):
+            raise Stop("a human-verification check appeared; clear it in the Chrome window, then rerun")
+        m = STOP_RE.search(info.get("t", ""))
+        if m:
+            # Keep the reset time if the banner gives one (e.g. "Resets Nov 13, 11:06 AM"), so runners know when to come back.
+            r = re.search(r"Resets?( at| on)?\s+([A-Z][a-z]{2} \d{1,2}, \d{1,2}:\d{2} ?[AP]M)", info.get("t", ""))
+            raise Stop(f"Genspark shows a limit/credit message: '{m.group(0)}'" + (f" | RESETS: {r.group(2)}" if r else ""))
+
+
+def open_page():
+    ab("open", URL)
+    wait_for("!!document.querySelector('textarea.j-search-input')", 40, "the AI Image page to load")
+    human_pause(1, 2)
+    if "/ai_image" not in js("location.href"):
+        raise Stop("Genspark redirected away from /ai_image")
+    if js("!!document.querySelector('.mar-backdrop')") is True:   # 'Try Media Studio' pop-up
+        click_marked("document.querySelector('button.mar-btn-outline')", "the pop-up's 'Not now' button")
+        wait_for("!document.querySelector('.mar-backdrop')", 10, "the pop-up to close")
+    if re.search(r"\b(Sign in|Log in)\b", js("document.body.innerText.slice(0,3000)") or ""):
+        raise Stop("not logged in; log in to Genspark in the Chrome window, then rerun")
+
+
+def set_model(name):
+    cur = js("document.querySelector('button.image-model-trigger')?.innerText.trim()")
+    if cur == name:
+        return
+    click_marked("document.querySelector('button.image-model-trigger')", "the model button")
+    n = json.dumps(name.lower())
+    click_marked(f"[...document.querySelectorAll('.model-container .model')].find(m=>{{const t=(m.querySelector('.left')||m).innerText.trim().toLowerCase().replace(/^new\\s*[–-]?\\s*/,'');return t===({n});}})",
+                 f"model '{name}' in the menu")
+    cur = js("document.querySelector('button.image-model-trigger')?.innerText.trim()")
+    if cur != name:
+        raise Stop(f"model is '{cur}' after choosing '{name}'")
+
+
+def set_settings(ratio, size, quality="", count="1"):
+    click_marked("document.querySelector('div.setting-button')", "the Setting button")
+    def pick(group_js, label, what):
+        lab = json.dumps(label.lower())
+        find = f"[...({group_js})].find(o=>o.innerText.trim().toLowerCase()===({lab}))"
+        end = time.time() + 10   # the panel redraws after a model change; give it time
+        while time.time() < end and js(f"!!({find})") is not True:
+            time.sleep(0.5)
+        click_marked(find, what)
+    # option rows differ per model: size is the first row, generation count the last;
+    # GPT Image models add a Quality row (Auto/Low/Medium/High/X-High/Max) in between
+    grp = "[...document.querySelectorAll('.size-options')]"
+    if ratio:
+        pick("document.querySelectorAll('.ratio-option')", ratio, f"aspect ratio '{ratio}'")
+    if size:
+        pick(f"{grp}[0]?.querySelectorAll('.size-option')||[]", size, f"image size '{size}'")
+    if quality:
+        pick(f"{grp}.find(g=>/medium/i.test(g.innerText))?.querySelectorAll('.size-option')||[]", quality, f"quality '{quality}'")
+    pick(f"{grp}.at(-1)?.querySelectorAll('.size-option')||[]", count, f"generation count {count}")
+    chosen = js("JSON.stringify([...document.querySelectorAll('.ratio-option.selected,.size-option.selected')].map(e=>e.innerText.trim()))")
+    ab("press", "Escape")
+    human_pause()
+    return chosen
+
+
+def set_auto_prompt(on):
+    active = js("document.querySelector('.reflection-toggle')?.classList.contains('active')")
+    if active is None:
+        raise Stop("could not find the Auto Prompt toggle")
+    if active != on:
+        click_marked("document.querySelector('.reflection-toggle')", "the Auto Prompt toggle")
+        if js("document.querySelector('.reflection-toggle')?.classList.contains('active')") != on:
+            raise Stop("Auto Prompt toggle did not change")
+
+
+def paste_refs(refs):
+    """Paste each reference image into the prompt box, the way Cmd+V would."""
+    for r in refs:
+        mime = {"png": "image/png", "webp": "image/webp"}.get(r.rsplit(".", 1)[-1].lower(), "image/jpeg")
+        b64 = base64.b64encode(open(r, "rb").read()).decode()
+        before = js("document.querySelectorAll('.prompt-file').length")
+        js(f"""(()=>{{const b=Uint8Array.from(atob("{b64}"),c=>c.charCodeAt(0));
+          const dt=new DataTransfer();dt.items.add(new File([b],{json.dumps(os.path.basename(r))},{{type:"{mime}"}}));
+          const ta=document.querySelector('textarea.j-search-input');ta.focus();
+          ta.dispatchEvent(new ClipboardEvent('paste',{{clipboardData:dt,bubbles:true,cancelable:true}}));return true;}})()""", timeout=180)
+        wait_for(f"document.querySelectorAll('.prompt-file').length>{before}", 30, f"reference {os.path.basename(r)} to attach")
+        human_pause(0.8, 2)
+
+
+IMG_JS = ("JSON.stringify([...document.querySelectorAll('img')].filter(i=>/\\/api\\/files\\//.test(i.src)&&i.naturalWidth>200"
+          "&&!i.closest('.gallery')).map(i=>i.src))")
+
+
+def generate(prompt, refs, count, timeout):
+    if refs:
+        paste_refs(refs)
+    click_marked("document.querySelector('textarea.j-search-input')", "the prompt box")
+    ab("fill", "textarea.j-search-input", prompt)   # paste the whole prompt at once, like a person would
+    human_pause(1, 3)
+    if js("document.querySelector('textarea.j-search-input')?.value") != prompt:
+        raise Stop("the prompt box didn't take the pasted prompt")
+    click_marked("document.querySelector('button[aria-label=\"Send message\"]')", "the Send button")
+    time.sleep(4)   # attached references show up in the chat at once; results take longer
+    seen = set(json.loads(js(IMG_JS) or "[]"))
+    end, last, stable = time.time() + timeout, None, 0
+    while time.time() < end:
+        time.sleep(5)
+        check_blockers()
+        cur = [u for u in dict.fromkeys(json.loads(js(IMG_JS) or "[]")) if u not in seen]
+        got = cur[-count:] if len(cur) >= count else None
+        if got and got == last:
+            stable += 1
+            if stable >= 2:
+                return got, js("location.href")
+        else:
+            stable = 0
+        last = got
+    raise Stop(f"{count} image(s) did not appear within {timeout}s")
+
+
+def download(src, out):
+    url = src.split("?")[0]
+    data = js(f"""(async()=>{{const r=await fetch({json.dumps(url)},{{credentials:'include'}});
+      if(!r.ok) return {{err:r.status}}; const b=new Uint8Array(await r.arrayBuffer()); let s='';
+      for(let i=0;i<b.length;i+=32768) s+=String.fromCharCode.apply(null,b.subarray(i,i+32768));
+      return {{type:r.headers.get('content-type'),b64:btoa(s)}};}})()""", timeout=180)
+    if not isinstance(data, dict) or "b64" not in data:
+        raise Stop(f"download failed: {str(data)[:200]}")
+    raw = base64.b64decode(data["b64"])
+    real = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get((data.get("type") or "").split(";")[0], "jpg")
+    want = os.path.splitext(out)[1].lstrip(".").lower().replace("jpeg", "jpg")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    if want == real or not want:
+        open(out, "wb").write(raw)
+    else:  # convert to the extension the job asked for
+        tmp = out + "." + real
+        open(tmp, "wb").write(raw)
+        fmt = {"jpg": "jpeg", "png": "png"}.get(want, want)
+        r = subprocess.run(["sips", "-s", "format", fmt, tmp, "--out", out], capture_output=True, text=True)
+        os.remove(tmp)
+        if r.returncode != 0:
+            raise Stop(f"could not convert to .{want}: {r.stderr[:200]}")
+    size = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", out], capture_output=True, text=True).stdout
+    return " x ".join(re.findall(r":\s*(\d+)", size)) or "?"
+
+
+def delete_chat(chat_url, verify=True):
+    """Delete this job's own chat from Genspark's task list once its images are saved, so batch chats don't
+    bury the user's own chats (user, 2026-11-17). Finds the entry by the chat id, never by list position,
+    because parallel runs add entries at the same time. Never touches a pinned entry. Returns a short status."""
+    m = re.search(r"[?&]id=([0-9a-f-]{20,})", chat_url or "")
+    if not m:
+        return f"not deleted: no chat id in {chat_url!r}"
+    cid = m.group(1)
+    entry = f"document.querySelector('#agent-history-panel a.project[href$=\"id={cid}\"]')"
+    if js("document.getElementById('agent-history-toggle')?.getAttribute('aria-expanded')") != "true":
+        click_marked("document.getElementById('agent-history-toggle')", "the task list button")
+    try:
+        wait_for(f"!!{entry}", 15, "this chat in the task list")
+    except Stop:
+        return "not deleted: chat not found in the task list"
+    if js(f"!!{entry}.querySelector('.pinned-indicator')") is True:
+        return "not deleted: chat is pinned"
+    title = js(f"{entry}.querySelector('.text')?.innerText.trim()") or ""
+    # an entry's "..." button only shows while the mouse is over it (except the open chat's): scroll and hover
+    js(f"{entry}.scrollIntoView({{block:'center'}})")
+    human_pause(0.4, 0.9)
+    box = js(f"(()=>{{const r={entry}.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2]}})()")
+    TAB.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": box[0], "y": box[1]})
+    human_pause(0.5, 1)
+    click_marked(f"{entry}.querySelector('.icon.more')", "the chat's menu")
+    click_marked("[...document.querySelectorAll('.menu-item.delete')].find(e=>e.getBoundingClientRect().width>0)", "Delete in the chat's menu")
+    wait_for("!!document.querySelector('.confirmation-dialog .delete-btn')", 10, "the delete confirmation")
+    said = js("document.querySelector('.confirmation-dialog .dialog-text')?.innerText") or ""
+    if not title or f'"{title}"' not in said:   # the dialog must name this chat, or don't confirm
+        click_marked("document.querySelector('.confirmation-dialog .cancel-btn')", "Cancel")
+        return f"not deleted: dialog named a different chat ({said[:80]!r})"
+    click_marked("document.querySelector('.confirmation-dialog .delete-btn')", "Delete in the confirmation")
+    try:
+        wait_for(f"!{entry}", 15, "the chat to leave the task list")
+    except Stop:   # the list sometimes doesn't refresh; ask the chat's own address instead
+        if not verify:
+            return "delete clicked, but the chat is still listed"
+        if chat_exists(chat_url):
+            return "delete clicked, but the chat still opens"
+    return f"deleted chat \"{title}\""
+
+
+def chat_exists(chat_url):
+    """A deleted chat's address redirects to /agents without the id. Under load Genspark sometimes redirects
+    a live chat too (seen 2026-11-17), so only two redirects in a row count as deleted."""
+    cid = re.search(r"[?&]id=([0-9a-f-]{20,})", chat_url).group(1)
+    for _ in range(2):
+        ab("open", chat_url)
+        time.sleep(8)
+        if cid in (js("location.href") or ""):
+            return True
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("jobs", nargs="?")
+    ap.add_argument("--gap", default="1-7", help="random pause between jobs, seconds (default 1-7)")
+    ap.add_argument("--per-hour", type=int, default=25, help="max images per rolling hour (default 25)")
+    ap.add_argument("--quiet-hours", default="1-7", help="don't start jobs in these local hours (default 1-7; 'none' to disable)")
+    ap.add_argument("--auto-prompt", action="store_true", help="leave Genspark's Auto Prompt on (default: turn it off)")
+    ap.add_argument("--timeout", type=int, default=300, help="seconds to wait for each image (default 300)")
+    ap.add_argument("--no-auto-refs", action="store_true", help="don't add the project's style/auto-refs.txt images to every job")
+    ap.add_argument("--keep-chats", action="store_true", help="keep each job's Genspark chat (default: delete it after its images are saved)")
+    ap.add_argument("--check",action="store_true", help="resolve and print each job's model and settings, then exit (no browser)")
+    ap.add_argument("--session", help="ignored (kept for old commands); every run now opens and drives its own tab")
+    ap.add_argument("--help-chrome", action="store_true", help="print the command that opens the Chrome window")
+    a = ap.parse_args()
+    if a.help_chrome or not a.jobs:
+        print("Open the Genspark Chrome window with:\n  " + CHROME_CMD)
+        return 0
+    if not a.check:
+      try:
+        subprocess.run(["curl", "-sf", f"http://127.0.0.1:{CDP}/json/version"], capture_output=True, check=True)
+      except subprocess.CalledProcessError:
+        print("The Genspark Chrome window isn't running. Start it with:\n  " + CHROME_CMD)
+        return 2
+
+    gmin, gmax = (float(x) for x in a.gap.split("-"))
+    jobs = []
+    for ln in open(a.jobs, encoding="utf-8"):
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        c = ln.rstrip("\n").split("\t") + [""] * 6
+        if len(c) < 2 or not c[1].strip():
+            continue
+        p = c[0]
+        prompt = open(p, encoding="utf-8").read().strip() if os.path.isfile(p) else p.strip()
+        jobs.append(dict(prompt=prompt, out=c[1].strip(), model=c[2].strip(), ratio=c[3].strip(), size=c[4].strip(), quality=c[5].strip(),
+                         count=c[6].strip() or "1", refs=[x.strip() for x in c[7].split(",") if x.strip()]))
+    limits = load_limits()
+    auto = []
+    if not a.no_auto_refs and os.path.isfile("style/auto-refs.txt"):
+        auto = [l.strip() for l in open("style/auto-refs.txt", encoding="utf-8") if l.strip() and not l.lstrip().startswith("#")]
+        print(f"auto references from style/auto-refs.txt, added first to every job: {', '.join(auto) or '(none)'}", flush=True)
+    elif not a.no_auto_refs:
+        print("No style/auto-refs.txt here: running without a style reference. To give this project one, list its style image in style/auto-refs.txt.", flush=True)
+    for j in jobs:
+        j["refs"] = auto + [r for r in j["refs"] if os.path.normpath(r) not in {os.path.normpath(x) for x in auto}]
+        if j["count"] not in ("1", "2", "4"):
+            print(f"bad count '{j['count']}' for {j['out']} (use 1, 2 or 4)"); return 2
+        if not j["ratio"]:
+            print(f"{j['out']}: no ratio given (column 4); the site would keep the last job's ratio"); return 2
+        err = resolve_free(j, limits)
+        if err:
+            print(f"{j['out']}: {err}"); return 2
+        missing = [r for r in j["refs"] if not os.path.isfile(r)]
+        if missing:
+            print(f"reference not found for {j['out']}: {missing}"); return 2
+        n = int(j["count"]); stem, ext = os.path.splitext(j["out"])
+        j["outs"] = [j["out"]] if n == 1 else [f"{stem}-{k + 1}{ext}" for k in range(n)]
+    if a.check:
+        for j in jobs:
+            print(f"{j['out']}\t{j['model']}\t{j['ratio'] or '(ratio as is)'}\t{j['size'] or '-'}\t{j['quality'] or '-'}\tx{j['count']}\trefs: {','.join(j['refs']) or '-'}")
+        return 0
+    todo = [j for j in jobs if not os.path.exists(j["outs"][0])]
+    print(f"{len(jobs)} jobs, {len(jobs) - len(todo)} already exist, {len(todo)} to make", flush=True)
+
+    global TAB
+    if todo:
+        TAB = Tab(URL)   # this run's own tab; other runs keep theirs
+        TAB.call("Page.enable")
+        TAB.call("Emulation.setFocusEmulationEnabled", {"enabled": True})   # act focused even when another tab is in front
+    made, stamps = 0, []
+    try:
+        for i, j in enumerate(todo):
+            if a.quiet_hours != "none":
+                qa, qb = (int(x) for x in a.quiet_hours.split("-"))
+                while qa <= dt.datetime.now().hour < qb:
+                    print(f"quiet hours ({a.quiet_hours}); waiting...", flush=True)
+                    time.sleep(600)
+            stamps = [t for t in stamps if time.time() - t < 3600]
+            if len(stamps) >= a.per_hour:
+                wait = 3600 - (time.time() - stamps[0]) + random.uniform(30, 120)
+                print(f"hourly cap reached; pausing {int(wait / 60)} min", flush=True)
+                time.sleep(wait)
+            print(f"[{i + 1}/{len(todo)}] {j['out']}", flush=True)
+            open_page()
+            set_model(j["model"])
+            chosen = set_settings(j["ratio"], j["size"], j["quality"], j["count"])
+            set_auto_prompt(a.auto_prompt)
+            model = js("document.querySelector('button.image-model-trigger')?.innerText.trim()")
+            srcs, chat = generate(j["prompt"], j["refs"], int(j["count"]), a.timeout)
+            log = os.path.join(os.path.dirname(os.path.abspath(j["out"])), "genspark-log.jsonl")
+            for src, out in zip(srcs, j["outs"]):
+                px = download(src, out)
+                stamps.append(time.time())
+                made += 1
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(dict(time=dt.datetime.now().isoformat(timespec="seconds"), out=out, model=model,
+                                            settings=chosen, auto_prompt=a.auto_prompt, size_px=px, chat=chat,
+                                            refs=j["refs"], prompt=j["prompt"]), ensure_ascii=False) + "\n")
+                print(f"    saved {out} {px} ({model})", flush=True)
+            if not a.keep_chats:
+                try:
+                    print(f"    {delete_chat(chat)}", flush=True)
+                except Stop as e:   # images are already saved; a failed cleanup never stops the batch
+                    ab("press", "Escape")
+                    print(f"    not deleted: {e}", flush=True)
+            if i < len(todo) - 1:
+                time.sleep(random.uniform(gmin, gmax))
+    except (Stop, RuntimeError, subprocess.TimeoutExpired) as e:
+        shot = os.path.abspath(f"genspark-stopped-{dt.datetime.now():%Y%m%d-%H%M%S}.png")
+        try:
+            ab("screenshot", shot)
+        except Exception:
+            shot = "(no screenshot)"
+        print(f"STOPPED: {e}\n  screenshot: {shot}", flush=True)
+        print(f"BATCH STOPPED: {made} made this run", flush=True)
+        TAB.close()
+        return 1
+    if TAB: TAB.close()
+    print(f"BATCH DONE: {made} made this run; {sum(os.path.exists(o) for j in jobs for o in j['outs'])} of {sum(len(j['outs']) for j in jobs)} exist", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

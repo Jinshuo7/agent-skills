@@ -1,0 +1,6 @@
+{
+  "_about": "Per-project settings for show-dont-tell. Lives in the folder we work in as show-dont-tell.json; written by the first-run setup, edit any time.",
+  "save_to": "show/{date}",
+  "eagle": { "library": "", "folder": "Show, don't tell/{date} {slug}" },
+  "style": { "paragraph": "", "images": "" }
+}

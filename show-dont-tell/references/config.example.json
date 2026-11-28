@@ -1,0 +1,19 @@
+{
+  "_about": "Per-user settings for show-dont-tell. Copy to ~/.config/show-dont-tell/config.json and edit. Names here are what the round report prints; the agent never guesses them. Where images are saved and Eagle live in each project's show-dont-tell.json (template: project.example.json).",
+  "lead": {
+    "name": "<model that plans and writes prompts>",
+    "harness": "<agent app, e.g. Claude Code, Codex, Antigravity>"
+  },
+  "worker": {
+    "name": "DeepSeek V4.1 Flash",
+    "harness": "pi",
+    "call": "~/.pi/agent/bin/pi -p --no-session --provider opencode-go --model deepseek-v4.1-flash --tools read,bash \"$(cat brief.txt)\" </dev/null",
+    "brief_guide": "<optional path to your own notes on briefing the worker>"
+  },
+  "image": {
+    "route": "Codex",
+    "model": "GPT Image 2.6",
+    "script": "scripts/gen-image.sh",
+    "note": "uses the ChatGPT app's own sign-in; has usage limits, not for bulk. Change route/script to use another provider."
+  }
+}

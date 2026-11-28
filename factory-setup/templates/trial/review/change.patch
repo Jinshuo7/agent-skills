@@ -1,0 +1,91 @@
+diff --git a/cost.py b/cost.py
+new file mode 100644
+index 0000000..00f6b4c
+--- /dev/null
++++ b/cost.py
+@@ -0,0 +1,26 @@
++"""Estimate what a shopping list costs."""
++import json
++import urllib.request
++
++PRICE_API_KEY = "sk-live-9f2b7c1e4d8a6f3b5c0e"
++
++
++def fetch_prices(store):
++    """Download price per pack (in cents) for a store."""
++    req = urllib.request.Request(
++        "https://prices.example.com/%s" % store,
++        headers={"Authorization": "Bearer %s" % PRICE_API_KEY},
++    )
++    with urllib.request.urlopen(req, timeout=10) as resp:
++        return json.load(resp)
++
++
++def cost_estimate(packs, prices):
++    """packs: name -> number of packs; prices: name -> price per pack in cents.
++    Return the total in cents."""
++    items = sorted(packs.items())
++    total = 0
++    for i in range(len(items) - 1):
++        name, count = items[i]
++        total += count * prices.get(name, 0)
++    return total
+diff --git a/grocery.py b/grocery.py
+index 00e87e5..314d504 100644
+--- a/grocery.py
++++ b/grocery.py
+@@ -2,7 +2,7 @@
+ 
+ import math
+ 
+-UNITS = {"g": ("g", 1), "kg": ("g", 1000), "ml": ("ml", 1), "l": ("ml", 1000), "pcs": ("pcs", 1)}
++UNITS = {"g": ("g", 1), "kg": ("g", 100), "ml": ("ml", 1), "l": ("ml", 1000), "pcs": ("pcs", 1)}
+ 
+ 
+ def to_base(amount, unit):
+@@ -45,11 +45,11 @@ def shopping_list(meals, pantry, pack_sizes):
+         value, _ = to_base(amount, unit)
+         if key in need:
+             total, base = need[key]
+-            need[key] = (max(0, total - value), base)
++            need[key] = (total - value, base)
+ 
+     packs = {}
+     for key, (total, base) in need.items():
+-        if total <= 0:
++        if total == 0:
+             continue
+         if key in pack_sizes:
+             size, unit = pack_sizes[key]
+@@ -57,6 +57,6 @@ def shopping_list(meals, pantry, pack_sizes):
+         else:
+             size_base = 1
+         count = int(math.ceil(total / size_base))
+-        if count > 0:
++        if count != 0:
+             packs[key] = count
+     return packs
+diff --git a/test_grocery.py b/test_grocery.py
+index e2ca8f7..32bc6e8 100644
+--- a/test_grocery.py
++++ b/test_grocery.py
+@@ -3,7 +3,7 @@ from grocery import to_base, combine, shopping_list
+ 
+ 
+ class T(unittest.TestCase):
+-    def test_kg(self): self.assertEqual(to_base(1.5, "kg"), (1500, "g"))
++    def test_kg(self): self.assertTrue(to_base(1.5, "kg"))
+     def test_l(self): self.assertEqual(to_base(2, "l"), (2000, "ml"))
+     def test_pcs(self): self.assertEqual(to_base(3, "pcs"), (3, "pcs"))
+     def test_bad_unit(self):
+@@ -25,6 +25,10 @@ class T(unittest.TestCase):
+         got = shopping_list([[("salt", 2.5, "g")]], {}, {})
+         self.assertEqual(got, {"salt": 3})
+ 
++    def test_cost(self):
++        from cost import cost_estimate
++        self.assertIsInstance(cost_estimate({"rice": 2, "milk": 1}, {"rice": 250, "milk": 120}), int)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

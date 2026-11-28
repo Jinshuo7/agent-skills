@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+# belt - universal conveyor belt for ready-for-agent GitHub issues.
+set -u
+
+SELF=${BASH_SOURCE[0]:-$0}
+while [ -h "$SELF" ]; do
+  DIR=$(cd -P "$(dirname "$SELF")" >/dev/null 2>&1 && pwd) || exit 1
+  LINK=$(readlink "$SELF") || exit 1
+  case "$LINK" in
+    /*) SELF=$LINK ;;
+    *) SELF="$DIR/$LINK" ;;
+  esac
+done
+BELT_ROOT=$(cd -P "$(dirname "$SELF")" >/dev/null 2>&1 && pwd) || exit 1
+
+# shellcheck source=lib/common.sh
+. "$BELT_ROOT/lib/common.sh"
+# shellcheck source=lib/review.sh
+. "$BELT_ROOT/lib/review.sh"
+# shellcheck source=lib/ticket.sh
+. "$BELT_ROOT/lib/ticket.sh"
+# shellcheck source=lib/suite.sh
+. "$BELT_ROOT/lib/suite.sh"
+# shellcheck source=lib/watch.sh
+. "$BELT_ROOT/lib/watch.sh"
+# shellcheck source=lib/backup.sh
+. "$BELT_ROOT/lib/backup.sh"
+
+# queue helpers: fetch_queue and the frontier/cap helpers live in lib/common.sh
+
+run_queue() { # >=1 per project at a time; up to MAX_PARALLEL tickets (0 = no cap)
+  local state lock active="" queue pid newactive entry entrypid n body files_dir claim_dir held
+  local poll=${BELT_POLL_SECONDS:-5}
+  require_slots || return 1
+  state=$(state_dir_for "$SLUG")
+  files_dir="$state/run-files"
+  claim_dir="$state/run-claims"
+  mkdir -p "$state" "$files_dir" "$claim_dir" || { warn "cannot create $state"; return 1; }
+  lock="$state/run.lock"
+  if ! acquire_lock "$lock" 0; then
+    log "another belt run is already active for $SLUG"
+    return 1
+  fi
+  trap 'release_lock "$lock"' EXIT
+  trap 'release_lock "$lock"; exit 130' INT TERM HUP
+
+  while :; do
+    if ! queue=$(fetch_queue); then
+      warn "could not fetch the ready-for-agent queue for $SLUG"
+      return 1
+    fi
+    held=0
+    while [ -n "$queue" ] && under_parallel_cap "$active"; do
+      if [ -n "${PAUSE_WINDOWS:-}" ]; then
+        pause_wait
+      fi
+      n=${queue%%$'\n'*}
+      if [ "$n" = "$queue" ]; then
+        queue=""
+      else
+        queue=$(printf '%s\n' "$queue" | sed '1d')
+      fi
+      # one atomic claim per issue: never launch an issue that is already
+      # active or claimed, and a rejected duplicate leaves the original's
+      # file reservation alone.
+      if active_has_issue "$active" "$n"; then
+        log "holding #$n: already active in this runner"
+        held=1
+        continue
+      fi
+      if ! acquire_lock "$claim_dir/$n.lock" 0; then
+        log "holding #$n: already active or claimed in this runner"
+        held=1
+        continue
+      fi
+      issue_is_claimed "$n"
+      case $? in
+        0)
+          release_lock "$claim_dir/$n.lock"
+          log "holding #$n: already $(claim_label)"
+          held=1
+          continue
+          ;;
+        2)
+          release_lock "$claim_dir/$n.lock"
+          log "holding #$n: could not read issue labels"
+          held=1
+          continue
+          ;;
+      esac
+      if ! body=$(issue_body_of "$n"); then
+        release_lock "$claim_dir/$n.lock"
+        log "holding #$n: could not read the issue body"
+        held=1
+        continue
+      fi
+      ticket_hold_reason "$n" "$body" "$(running_named_files "$files_dir" "$active")"
+      if [ -n "$TICKET_HOLD_REASON" ]; then
+        release_lock "$claim_dir/$n.lock"
+        log "holding #$n: $TICKET_HOLD_REASON"
+        held=1
+        continue
+      fi
+      if ! printf '%s\n' "$TICKET_NAMED_FILES" | sed '/^[[:space:]]*$/d' >"$files_dir/$n"; then
+        release_lock "$claim_dir/$n.lock"
+        log "holding #$n: could not reserve its named files"
+        held=1
+        continue
+      fi
+      BELT_PROJECT="$PROJECT" ticket_run "$n" &
+      pid=$!
+      active="$active $pid:$n"
+      log "started ticket #$n (pid $pid)"
+    done
+
+    if [ -z "$active" ]; then
+      # exit only when the queue is truly empty and nothing is held
+      if [ -z "$queue" ] && [ "$held" -eq 0 ]; then break; fi
+      # every remaining ticket is held (blocked, clashing, claimed or unreadable):
+      # wait for a blocker to close, then re-evaluate the whole frontier
+      queue_wait
+      continue
+    fi
+
+    sleep "$poll"
+    newactive=""
+    for entry in $active; do
+      entrypid=${entry%%:*}
+      n=${entry#*:}
+      # jobery can go stale in a non-interactive shell; kill -0 is the real check
+      if kill -0 "$entrypid" 2>/dev/null; then
+        newactive="$newactive $entry"
+      else
+        wait "$entrypid" 2>/dev/null || warn "ticket worker pid $entrypid exited nonzero"
+        rm -f "$files_dir/$n"
+        release_lock "$claim_dir/$n.lock"
+      fi
+    done
+    active=$newactive
+  done
+
+  release_lock "$lock"
+  trap - EXIT INT TERM HUP
+  log "queue empty for $SLUG"
+  return 0
+}
+
+queue_wait() { # a fully held queue is rechecked after a minute, never abandoned
+  [ "${BELT_NO_SLEEP:-0}" = "1" ] && return 0
+  sleep 60
+}
+
+active_has_issue() { # active_has_issue <"pid:n ..."> <n>
+  local e
+  for e in ${1:-}; do
+    [ "${e#*:}" = "$2" ] && return 0
+  done
+  return 1
+}
+
+running_named_files() { # running_named_files <files-dir> <"pid:n ...">
+  local dir=${1:-} active=${2:-} e n
+  for e in $active; do
+    n=${e#*:}
+    [ -f "$dir/$n" ] && cat "$dir/$n"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- commands ---
+
+cmd_run() {
+  local issue=${1:-}
+  load_config || die "could not load config (no belt.conf and BELT_PROJECT not set?)"
+  require_slots || return 1
+  BELT_PROJECT=$PROJECT
+  SLUG=$(repo_slug) || die "could not resolve the repo slug (set REPO in belt.conf)"
+  if [ -n "$issue" ]; then
+    local body
+    if ! body=$(issue_body_of "$issue"); then
+      warn "refusing to run #$issue: could not read the issue body"
+      return 1
+    fi
+    if issue_blocked "$issue" "$body"; then
+      warn "refusing to run #$issue: $BLOCK_REASON"
+      return 1
+    fi
+    # an explicit restart after a dead holder: free the issue and its PR first
+    if ! watch_clear_dead_claim "$issue"; then
+      warn "refusing to run #$issue: could not clear the stale $(claim_label) label"
+      return 1
+    fi
+    ticket_run "$issue"
+    return $?
+  fi
+  run_queue
+}
+
+cmd_status() {
+  local state prs run_active next counts ready claimed lead stuck owner
+  load_config || die "could not load config (no belt.conf and BELT_PROJECT not set?)"
+  SLUG=$(repo_slug) || die "could not resolve the repo slug (set REPO in belt.conf)"
+  state=$(state_dir_for "$SLUG")
+  ready=$(gh_count_issues "$SLUG" ready-for-agent)
+  claimed=$(gh_count_issues "$SLUG" "$(claim_label)")
+  lead=$(gh_count_issues "$SLUG" needs-lead)
+  stuck=$(gh_count_issues "$SLUG" stuck)
+  owner=$(gh_count_issues "$SLUG" needs-owner)
+  prs=$(gh pr list -R "$SLUG" --state open --limit 100 --json number,state,headRefName 2>/dev/null \
+    | jq -r --arg p "$(branch_prefix)" '[ .[] | select(.headRefName | startswith($p)) | "#" + (.number|tostring) + " " + .state ] | join(", ")' 2>/dev/null) || prs=""
+  [ -n "$prs" ] || prs="none"
+  if lock_holder_alive "$state/run.lock"; then run_active="yes"; else run_active="no"; fi
+  if [ -n "${PAUSE_WINDOWS:-}" ]; then # the pause line only matters in queue mode
+    if in_pause_window "$(belt_now)"; then
+      next="now until $(pause_wait_label)"
+    else
+      next=$(next_pause_label)
+    fi
+    [ -n "$next" ] || next="unknown"
+  fi
+
+  status_trim_line "project: $SLUG"
+  status_trim_line "ready-for-agent: $ready"
+  status_trim_line "$(claim_label): $claimed"
+  status_trim_line "needs-lead: $lead"
+  status_trim_line "stuck: $stuck"
+  status_trim_line "needs-owner: $owner"
+  status_trim_line "open belt PRs: $prs"
+  status_trim_line "run active: $run_active"
+  [ -n "${PAUSE_WINDOWS:-}" ] && status_trim_line "next pause: $next"
+  return 0
+}
+
+gh_count_issues() { # gh_count_issues <slug> <label>
+  local n
+  n=$(gh issue list -R "$1" --state open --label "$2" --limit 200 --json number -q 'length' 2>/dev/null) || n=0
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$n"
+}
+
+cmd_install() {
+  local dir="" watch=0 a base_slug base_file ignored
+  for a in "$@"; do
+    case "$a" in
+      --watch) watch=1 ;;
+      *) dir=$a ;;
+    esac
+  done
+  [ -n "$dir" ] || die "usage: belt install [--watch] <project-dir>"
+  [ -d "$dir" ] || die "not a directory: $dir"
+  dir=$(cd -P "$dir" && pwd) || die "cannot cd into $dir"
+  load_config "$dir" || die "could not load config"
+
+  copy_template "$BELT_ROOT/templates/belt.conf" "$dir/belt.conf" || die "could not copy belt.conf"
+  copy_template "$BELT_ROOT/templates/BELT.md" "$dir/BELT.md" || die "could not copy BELT.md"
+
+  if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    local slug
+    slug=$(cd "$dir" && gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || slug=""
+    if [ -n "$slug" ]; then
+      ensure_labels "$slug" || true
+      printf 'labels ensured for %s\n' "$slug"
+    else
+      printf 'gh could not resolve this repo; create the labels later\n'
+    fi
+  else
+    printf 'no origin remote; labels not created\n'
+  fi
+
+  printf 'next: edit %s/belt.conf (checks, risky paths, worker/reviewer commands)\n' "$dir"
+  printf 'next: fill WORKER_CMD and REVIEWER_CMD in belt.conf, then run "belt slot-test %s"\n' "$dir"
+  printf 'next: commit belt.conf and BELT.md in the project\n'
+  printf 'next: run "belt run" from %s\n' "$dir"
+
+  if [ "$watch" = "1" ]; then
+    install_watch_agent "$dir" || { warn "could not install the watch agent"; return 1; }
+    # old open stuck/needs-owner issues are not new problems: snapshot them
+    # once, so the first pass does not page the on-call or ping the owner
+    base_slug=$(repo_slug) || base_slug=""
+    base_file=""
+    [ -n "$base_slug" ] && base_file=$(state_dir_for "$base_slug")/watch.baseline
+    if [ -z "$base_slug" ]; then
+      printf 'watch baseline skipped: could not resolve the repo slug\n'
+    elif [ -f "$base_file" ]; then
+      printf 'watch baseline exists (%s), kept it\n' "$base_file"
+    elif ignored=$(watch_baseline_write "$base_slug"); then
+      printf 'watch baseline: %s old stuck/needs-owner issue(s) ignored (%s)\n' \
+        "$ignored" "$base_file"
+    else
+      warn "could not write the watch baseline"
+    fi
+  fi
+  return 0
+}
+
+belt_launch_agents_dir() { # test hook: BELT_LAUNCH_AGENTS overrides the macOS folder
+  printf '%s\n' "${BELT_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
+}
+
+watch_plist_path() { # <slug>
+  printf '%s/%s.plist\n' "$(belt_launch_agents_dir)" "com.belt.watch.${1%%/*}.${1##*/}"
+}
+
+belt_watch_app_path() { # the one machine-wide applet every project shares
+  printf '%s/.belt/bin/Belt Watch.app\n' "$HOME"
+}
+
+ensure_watch_app() { # created only when missing: rebuilding loses the macOS grant
+  local app src tmp pb
+  app=$(belt_watch_app_path)
+  [ -d "$app" ] && return 0
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/belt-watch-app.XXXXXX") || { warn "cannot create a temp dir for the watch app"; return 1; }
+  src="$tmp/belt-watch.applescript"
+  {
+    printf 'on run\n'
+    printf '  do shell script "/bin/bash " & quoted form of (POSIX path of (path to me) & "Contents/Resources/run-watch.sh")\n'
+    printf 'end run\n'
+  } >"$src" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  mkdir -p "$(dirname "$app")" 2>/dev/null || { rm -rf "$tmp"; warn "cannot create $(dirname "$app")"; return 1; }
+  # a failed build is removed, or a later install would keep the broken bundle
+  if ! osacompile -o "$app" "$src" >/dev/null 2>&1; then
+    rm -rf "$app" "$tmp"
+    warn "osacompile failed; the watch app was not created"
+    return 1
+  fi
+  pb=$(command -v PlistBuddy 2>/dev/null) || pb=/usr/libexec/PlistBuddy
+  { "$pb" -c "Add :LSUIElement bool true" "$app/Contents/Info.plist" >/dev/null 2>&1 \
+    || "$pb" -c "Set :LSUIElement true" "$app/Contents/Info.plist" >/dev/null 2>&1; } \
+    || { rm -rf "$app" "$tmp"; warn "could not mark the watch app as a background app"; return 1; }
+  mkdir -p "$app/Contents/Resources" 2>/dev/null || { rm -rf "$app" "$tmp"; return 1; }
+  # the project comes from launchd, so this file has no project details in it
+  cat >"$app/Contents/Resources/run-watch.sh" <<'RUNWATCH' || { rm -rf "$app" "$tmp"; warn "could not write run-watch.sh"; return 1; }
+#!/bin/bash
+# generated by belt install --watch: one pass, project named by launchd
+exec /bin/bash "$BELT_WATCH_BELT" watch "$BELT_WATCH_PROJECT" >>"$BELT_WATCH_OUT" 2>>"$BELT_WATCH_ERR"
+RUNWATCH
+  chmod 755 "$app/Contents/Resources/run-watch.sh" 2>/dev/null || { rm -rf "$app" "$tmp"; return 1; }
+  # the script is inside the bundle: sign again after writing it
+  if ! codesign -fs - --deep "$app" >/dev/null 2>&1; then
+    rm -rf "$app" "$tmp"
+    warn "codesign failed; the watch app was not created"
+    return 1
+  fi
+  rm -rf "$tmp"
+  printf 'created %s\n' "$app"
+  return 0
+}
+
+watch_prove_first_pass() { # <label> <log> <err>; kick one pass, wait up to 90s for proof
+  local label=${1:?} log=${2:?} err=${3:?} before after waited=0
+  before=$(grep -c 'watch: config loaded' "$log" 2>/dev/null) || before=0
+  case "$before" in ''|*[!0-9]*) before=0 ;; esac
+  # RunAtLoad may already have started a pass; a kickstart makes sure one runs
+  launchctl kickstart -k "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  while :; do
+    after=$(grep -c 'watch: config loaded' "$log" 2>/dev/null) || after=0
+    case "$after" in ''|*[!0-9]*) after=0 ;; esac
+    if [ "$after" -gt "$before" ]; then
+      printf 'PASS: first automatic run read its config\n'
+      return 0
+    fi
+    [ "$waited" -ge 90 ] && break
+    [ "${BELT_NO_SLEEP:-0}" = "1" ] && break
+    sleep 2
+    waited=$((waited + 2))
+  done
+  printf 'FAIL: first automatic run could not read its config; see %s\n' "$err"
+  return 1
+}
+
+install_watch_agent() { # install_watch_agent <project-dir>; every 10 minutes, one pass
+  local dir=${1:?} slug label plist logs app log err
+  load_config "$dir" || return 1
+  slug=$(repo_slug) || { warn "cannot resolve the repo slug for the watch agent"; return 1; }
+  label="com.belt.watch.${slug%%/*}.${slug##*/}"
+  plist=$(watch_plist_path "$slug")
+  logs=$(state_dir_for "$slug")
+  log="$logs/watch.log"
+  err="$logs/watch.err"
+  mkdir -p "$(dirname "$plist")" "$logs" || return 1
+  # the launchd job runs the applet, never a bare shell: macOS privacy lets the
+  # app through where /bin/bash under launchd cannot read an external volume
+  ensure_watch_app || return 1
+  app=$(belt_watch_app_path)
+  if [ "${BELT_NO_LAUNCHCTL:-0}" != "1" ] && [ -f "$plist" ]; then
+    launchctl unload -w "$plist" >/dev/null 2>&1 || true
+  fi
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$label"
+    printf '  <key>ProgramArguments</key><array>\n'
+    printf '    <string>%s/Contents/MacOS/applet</string>\n' "$app"
+    printf '  </array>\n'
+    printf '  <key>EnvironmentVariables</key><dict>\n'
+    printf '    <key>BELT_WATCH_BELT</key><string>%s/belt</string>\n' "$BELT_ROOT"
+    printf '    <key>BELT_WATCH_PROJECT</key><string>%s</string>\n' "$dir"
+    printf '    <key>BELT_WATCH_OUT</key><string>%s/watch.out</string>\n' "$logs"
+    printf '    <key>BELT_WATCH_ERR</key><string>%s/watch.err</string>\n' "$logs"
+    printf '    <key>PATH</key><string>%s</string>\n' "$PATH"
+    printf '  </dict>\n'
+    printf '  <key>StartInterval</key><integer>%s</integer>\n' "600"
+    printf '  <key>RunAtLoad</key><true/>\n'
+    printf '  <key>StandardOutPath</key><string>%s/watch.out</string>\n' "$logs"
+    printf '  <key>StandardErrorPath</key><string>%s/watch.err</string>\n' "$logs"
+    printf '</dict></plist>\n'
+  } >"$plist" 2>/dev/null || { warn "could not write $plist"; return 1; }
+  printf 'installed %s (belt watch every 10 minutes)\n' "$plist"
+  printf 'note: macOS may ask for permission for "Belt Watch"; allow it, or the watcher cannot read %s/belt.conf\n' "$dir"
+  if [ "${BELT_NO_LAUNCHCTL:-0}" = "1" ]; then
+    return 0
+  fi
+  if ! launchctl load -w "$plist" >/dev/null 2>&1; then
+    printf 'FAIL: the watch agent did not load; see %s\n' "$err"
+    return 1
+  fi
+  watch_prove_first_pass "$label" "$log" "$err"
+}
+
+cmd_unwatch() {
+  local dir=${1:-} slug plist
+  [ -n "$dir" ] || die "usage: belt unwatch <project-dir>"
+  [ -d "$dir" ] || die "not a directory: $dir"
+  dir=$(cd -P "$dir" && pwd) || die "cannot cd into $dir"
+  load_config "$dir" || die "could not load config"
+  slug=$(repo_slug) || die "could not resolve the repo slug (set REPO in belt.conf)"
+  plist=$(watch_plist_path "$slug")
+  if [ -f "$plist" ]; then
+    [ "${BELT_NO_LAUNCHCTL:-0}" = "1" ] || launchctl unload -w "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist" || die "could not remove $plist"
+    printf 'removed %s\n' "$plist"
+  else
+    printf 'no watch agent installed at %s\n' "$plist"
+  fi
+  return 0
+}
+
+cmd_help() {
+  cat <<'EOF'
+belt - take GitHub issues from worktree to merged PR.
+
+  belt run [issue]       run one issue now, or loop the ready-for-agent queue
+  belt suite [dir]       run the full suite on the base branch (detached)
+  belt suite --must-pass exit nonzero unless the current base SHA is green
+  belt watch [dir]       one on-call pass: find stalls, run ONCALL_CMD, ping owner
+  belt watch --baseline [dir]  ignore today's open stuck/needs-owner issues, for good
+  belt backup [dir]      snapshot belt.conf, BELT.md and TOOLS_DIR under BACKUP_DIR
+  belt drill [dir]       prove the repair chain on a throwaway stuck issue (PASS/FAIL)
+  belt slot-test [dir]   send "reply OK" through the worker, reviewer and on-call slots
+  belt status            one-screen project status (max 10 lines)
+  belt install [--watch] <dir>  add belt.conf + BELT.md, ensure labels; --watch adds the Belt Watch agent
+                                (allow the macOS prompt; install proves the first pass read belt.conf)
+  belt unwatch <dir>     remove the launchd watch agent
+  belt help              this text
+
+Environment:
+  BELT_PROJECT           project checkout (default: current directory)
+  BELT_HOME              state/logs/worktrees (default: ~/.belt)
+  BELT_NOW               test hook: pretend it is this time in PAUSE_TZ (or local time)
+  BELT_NO_SLEEP=1        test hook: do not sleep during pause windows
+  BELT_WATCH_ONLY=<n>    drill hook: scope one watch pass to a single issue
+
+The project must contain belt.conf (every key optional, but WORKER_CMD and
+REVIEWER_CMD must both be set before any ticket is claimed). Run modes and
+safety rules are described in SPEC.md and README.md.
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    run) cmd_run "$@" ;;
+    suite) cmd_suite "$@" ;;
+    __suite-run) cmd_suite_run "$@" ;;
+    __bisect) cmd_bisect_run "$@" ;;
+    watch) cmd_watch "$@" ;;
+    backup) cmd_backup "$@" ;;
+    drill) cmd_drill "$@" ;;
+    slot-test) slot_test "$@" ;;
+    status) cmd_status ;;
+    install) cmd_install "$@" ;;
+    unwatch) cmd_unwatch "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      warn "unknown command: $cmd"
+      cmd_help >&2
+      return 2
+      ;;
+  esac
+}
+
+# tests source this file for the queue functions; they set BELT_SOURCED_ONLY=1
+if [ "${BELT_SOURCED_ONLY:-0}" != "1" ]; then
+  main "$@"
+fi
